@@ -1,20 +1,22 @@
 from contextlib import AsyncExitStack
-from typing import Dict, List, Optional
-
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.sse import sse_client
-from mcp.client.stdio import stdio_client
-from mcp.types import ImageContent, ListToolsResult, TextContent
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from app.logger import logger
 from app.tool.base import BaseTool, ToolResult
 from app.tool.tool_collection import ToolCollection
 
 
+# mcp 库体积较大（导入约 0.8 秒），延迟到实际连接 MCP 服务器时再导入，
+# 以加快应用启动速度。类型标注仅在静态检查时使用。
+if TYPE_CHECKING:
+    from mcp import ClientSession
+    from mcp.types import ListToolsResult
+
+
 class MCPClientTool(BaseTool):
     """Represents a tool proxy that can be called on the MCP server from the client side."""
 
-    session: Optional[ClientSession] = None
+    session: Optional[Any] = None
     server_id: str = ""  # Add server identifier
     original_name: str = ""
 
@@ -22,6 +24,9 @@ class MCPClientTool(BaseTool):
         """Execute the tool by making a remote call to the MCP server."""
         if not self.session:
             return ToolResult(error="Not connected to MCP server")
+
+        # 延迟导入 mcp 类型，减少启动时间
+        from mcp.types import ImageContent, TextContent
 
         try:
             logger.info(f"Executing tool: {self.original_name}")
@@ -51,7 +56,7 @@ class MCPClients(ToolCollection):
     A collection of tools that connects to multiple MCP servers and manages available tools through the Model Context Protocol.
     """
 
-    sessions: Dict[str, ClientSession] = {}
+    sessions: Dict[str, Any] = {}
     exit_stacks: Dict[str, AsyncExitStack] = {}
     server_instructions: Dict[str, str] = {}
     description: str = "MCP client tools for server interaction"
@@ -67,6 +72,10 @@ class MCPClients(ToolCollection):
         """Connect to an MCP server using SSE transport."""
         if not server_url:
             raise ValueError("Server URL is required.")
+
+        # 延迟导入 mcp 库，减少启动时间
+        from mcp import ClientSession
+        from mcp.client.sse import sse_client
 
         server_id = server_id or server_url
 
@@ -95,6 +104,10 @@ class MCPClients(ToolCollection):
         """Connect to an MCP server using stdio transport."""
         if not command:
             raise ValueError("Server command is required.")
+
+        # 延迟导入 mcp 库，减少启动时间
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
 
         server_id = server_id or command
 
@@ -173,8 +186,11 @@ class MCPClients(ToolCollection):
 
         return sanitized
 
-    async def list_tools(self) -> ListToolsResult:
+    async def list_tools(self) -> Any:
         """List all available tools."""
+        # 延迟导入 mcp 类型，减少启动时间
+        from mcp.types import ListToolsResult
+
         tools_result = ListToolsResult(tools=[])
         for session in self.sessions.values():
             response = await session.list_tools()

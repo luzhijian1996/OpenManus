@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import tomllib
 from pathlib import Path
@@ -141,6 +142,10 @@ class MCPSettings(BaseModel):
     server_reference: str = Field(
         "app.mcp.server", description="Module reference for the MCP server"
     )
+    disable_browser_use: bool = Field(
+        False,
+        description="Disable the automatic Browser Use CLI 3.0 MCP server connection",
+    )
     servers: Dict[str, MCPServerConfig] = Field(
         default_factory=dict, description="MCP server configurations"
     )
@@ -215,6 +220,13 @@ class Config:
                     self._initialized = True
 
     @staticmethod
+    def _resolve_api_key(api_key: str) -> str:
+        """解析 API key：配置为空时回退到环境变量（DashScope 使用 DASHSCOPE_API_KEY）。"""
+        if api_key:
+            return api_key
+        return os.getenv("DASHSCOPE_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
+
+    @staticmethod
     def _get_config_path() -> Path:
         root = PROJECT_ROOT
         config_path = root / "config" / "config.toml"
@@ -233,6 +245,7 @@ class Config:
     def _load_initial_config(self):
         raw_config = self._load_config()
         base_llm = raw_config.get("llm", {})
+        # 只留下值本身是 dict 的子表，如 {"vision": {...}}
         llm_overrides = {
             k: v for k, v in raw_config.get("llm", {}).items() if isinstance(v, dict)
         }
@@ -240,7 +253,7 @@ class Config:
         default_settings = {
             "model": base_llm.get("model"),
             "base_url": base_llm.get("base_url"),
-            "api_key": base_llm.get("api_key"),
+            "api_key": Config._resolve_api_key(base_llm.get("api_key", "")),
             "max_tokens": base_llm.get("max_tokens", 4096),
             "max_input_tokens": base_llm.get("max_input_tokens"),
             "temperature": base_llm.get("temperature", 1.0),
@@ -314,7 +327,13 @@ class Config:
             "llm": {
                 "default": default_settings,
                 **{
-                    name: {**default_settings, **override_config}
+                    name: {
+                        **default_settings,
+                        **override_config,
+                        # 子表（如 vision）的 api_key 为空时，继承 default 已解析的 key
+                        "api_key": override_config.get("api_key")
+                        or default_settings["api_key"],
+                    }
                     for name, override_config in llm_overrides.items()
                 },
             },

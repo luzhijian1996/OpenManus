@@ -7,7 +7,7 @@ from app.agent.mcp import MCPAgent
 from app.config import config
 from app.logger import logger
 
-
+"""MCP工具模式运行器 入口"""
 class MCPRunner:
     """Runner class for MCP Agent with proper path handling and configuration."""
 

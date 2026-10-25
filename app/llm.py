@@ -18,7 +18,6 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from app.bedrock import BedrockClient
 from app.config import LLMSettings, config
 from app.exceptions import TokenLimitExceeded
 from app.logger import logger  # Assuming a logger is set up in your app
@@ -39,6 +38,17 @@ MULTIMODAL_MODELS = [
     "claude-3-opus-20240229",
     "claude-3-sonnet-20240229",
     "claude-3-haiku-20240307",
+    # DashScope 视觉模型（阿里云百炼 OpenAI 兼容模式）
+    "qwen-vl-plus",
+    "qwen-vl-max",
+    "qwen/qwen2.5-vl-72b-instruct",
+    "qwen2.5-vl-72b-instruct",
+    "qwen2.5-vl-32b-instruct",
+    "qwen2.5-vl-7b-instruct",
+    "qwen3-vl-plus",
+    "qwen3-vl-flash",
+    "deepseek-v4.1-flash",  # 当前项目配置的默认模型
+    "qwen3.8-max",
 ]
 
 
@@ -220,6 +230,9 @@ class LLM:
                     api_version=self.api_version,
                 )
             elif self.api_type == "aws":
+                # 延迟导入 BedrockClient（boto3 导入较慢），仅在 AWS 模式时加载
+                from app.bedrock import BedrockClient
+
                 self.client = BedrockClient()
             else:
                 self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)

@@ -5,6 +5,7 @@ from app.agent.mcp import MCPAgent
 from app.logger import logger
 from app.prompt.browser import NEXT_STEP_PROMPT
 from app.schema import Message
+from app.tool.sandbox.sb_browser_tool import SandboxBrowserTool
 from app.tool.terminate import Terminate
 
 
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
 
 
 _SANDBOX_BROWSER_TOOL_NAME = "sandbox_browser"
+_BROWSER_USE_TOOL_NAME = "browser_use"
 
 
 class BrowserContextHelper:
@@ -21,10 +23,17 @@ class BrowserContextHelper:
         self.agent = agent
         self._current_base64_image: Optional[str] = None
 
+    def _find_browser_tool(self):
+        """两级回退查找浏览器工具：优先 BrowserUseTool，其次 SandboxBrowserTool。"""
+        browser_tool = self.agent.available_tools.get_tool(_BROWSER_USE_TOOL_NAME)
+        if not browser_tool:
+            browser_tool = self.agent.available_tools.get_tool(_SANDBOX_BROWSER_TOOL_NAME)
+        return browser_tool
+
     async def get_browser_state(self) -> Optional[dict]:
-        browser_tool = self.agent.available_tools.get_tool(_SANDBOX_BROWSER_TOOL_NAME)
+        browser_tool = self._find_browser_tool()
         if not browser_tool or not hasattr(browser_tool, "get_current_state"):
-            logger.warning("SandboxBrowserTool not found or has no current state")
+            logger.warning("Browser tool not found or has no get_current_state method")
             return None
         try:
             result = await browser_tool.get_current_state()
@@ -41,10 +50,10 @@ class BrowserContextHelper:
             return None
 
     async def format_next_step_prompt(self) -> str:
-        """Gets browser state and formats the browser prompt."""
+        """获取浏览器状态并格式化浏览器提示词。"""
         browser_state = await self.get_browser_state()
         url_info, tabs_info, content_above_info, content_below_info = "", "", "", ""
-        results_info = ""  # Or get from agent if needed elsewhere
+        results_info = ""
 
         if browser_state and not browser_state.get("error"):
             url_info = f"\n   URL: {browser_state.get('url', 'N/A')}\n   Title: {browser_state.get('title', 'N/A')}"
@@ -58,15 +67,26 @@ class BrowserContextHelper:
             if pixels_below > 0:
                 content_below_info = f" ({pixels_below} pixels)"
 
+            # 调试信息：显示可交互元素数量
+            interactive_elements = browser_state.get("interactive_elements", "")
+            element_count = interactive_elements.count("[") if interactive_elements else 0
+            logger.info(f"🔍 Browser state: {element_count} interactive elements detected")
+            logger.debug(f"🔍 Browser URL: {browser_state.get('url', 'N/A')}")
+            logger.debug(f"🔍 Browser Title: {browser_state.get('title', 'N/A')}")
+            if interactive_elements:
+                preview = interactive_elements[:200] + "..." if len(interactive_elements) > 200 else interactive_elements
+                logger.debug(f"🔍 Interactive elements preview: {preview}")
+
+            # 发送截图给 LLM 进行视觉理解
             if self._current_base64_image:
                 image_message = Message.user_message(
                     content="Current browser screenshot:",
                     base64_image=self._current_base64_image,
                 )
                 self.agent.memory.add_message(image_message)
-                self._current_base64_image = None  # Consume the image after adding
+                self._current_base64_image = None  # 添加后消耗图片
 
-        return NEXT_STEP_PROMPT.format(
+        prompt = NEXT_STEP_PROMPT.format(
             url_placeholder=url_info,
             tabs_placeholder=tabs_info,
             content_above_placeholder=content_above_info,
@@ -74,8 +94,20 @@ class BrowserContextHelper:
             results_placeholder=results_info,
         )
 
+        # 追加交互元素列表到 prompt（参考项目的亮点：让 LLM 直接看到可点击元素）
+        if browser_state and not browser_state.get("error"):
+            interactive_elements = browser_state.get("interactive_elements", "")
+            if interactive_elements:
+                prompt += "\n\n[Current state starts here]\n"
+                prompt += "Interactive Elements:\n"
+                prompt += interactive_elements
+                prompt += "\n"
+
+        return prompt
+
     async def cleanup_browser(self):
-        browser_tool = self.agent.available_tools.get_tool(_SANDBOX_BROWSER_TOOL_NAME)
+        """清理浏览器资源。"""
+        browser_tool = self._find_browser_tool()
         if browser_tool and hasattr(browser_tool, "cleanup"):
             await browser_tool.cleanup()
 

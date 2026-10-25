@@ -32,7 +32,7 @@ class ReActAgent(BaseAgent, ABC):
 
     async def step(self) -> str:
         """Execute a single step: think and act."""
-        should_act = await self.think()
+        should_act = await self.think()  # think：决定下一步行动
         if not should_act:
             return "Thinking complete - no action needed"
         return await self.act()

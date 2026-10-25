@@ -18,6 +18,7 @@ from app.tool.sandbox.sb_shell_tool import SandboxShellTool
 from app.tool.sandbox.sb_vision_tool import SandboxVisionTool
 
 
+"""专门使用沙箱工具的Agent"""
 class SandboxManus(ToolCallAgent):
     """A versatile general-purpose agent with support for both local and MCP tools."""
 
@@ -76,11 +77,17 @@ class SandboxManus(ToolCallAgent):
         try:
             # 创建新沙箱
             if password:
+                # 创建daytona云端沙箱
                 sandbox = create_sandbox(password=password)
                 self.sandbox = sandbox
             else:
                 raise ValueError("password must be provided")
+            # 提供图形化桌面，用于手动操作和观察 GUI 应用
+            # 一个可以看见和点击的“虚拟电脑桌面”
             vnc_link = sandbox.get_preview_link(6080)
+
+            # 为沙箱内的 Web 服务生成安全的对外链接
+            # 一个可以分享和访问的“网站地址”
             website_link = sandbox.get_preview_link(8080)
             vnc_url = vnc_link.url if hasattr(vnc_link, "url") else str(vnc_link)
             website_url = (

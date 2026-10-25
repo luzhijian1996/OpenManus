@@ -1,18 +1,22 @@
 import os
 from typing import Dict, List, Optional
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
+from app.agent.browser import BrowserContextHelper
 from app.agent.toolcall import ToolCallAgent
 from app.config import config
+from app.llm import LLM, MULTIMODAL_MODELS
 from app.logger import logger
 from app.prompt.manus import NEXT_STEP_PROMPT, SYSTEM_PROMPT
 from app.schema import Message
 from app.tool import Terminate, ToolCollection
 from app.tool.ask_human import AskHuman
+from app.tool.browser_use_tool import BrowserUseTool
 from app.tool.mcp import MCPClients, MCPClientTool
 from app.tool.python_execute import PythonExecute
 from app.tool.str_replace_editor import StrReplaceEditor
+from app.tool.web_search import WebSearch
 
 
 _BROWSER_USE_SERVER_ID = "browser_use"
@@ -57,6 +61,8 @@ class Manus(ToolCallAgent):
     available_tools: ToolCollection = Field(
         default_factory=lambda: ToolCollection(
             PythonExecute(),
+            BrowserUseTool(),
+            WebSearch(),
             StrReplaceEditor(),
             AskHuman(),
             Terminate(),
@@ -64,6 +70,7 @@ class Manus(ToolCallAgent):
     )
 
     special_tool_names: list[str] = Field(default_factory=lambda: [Terminate().name])
+    browser_context_helper: Optional[BrowserContextHelper] = None
 
     # Track connected MCP servers
     connected_servers: Dict[str, str] = Field(
@@ -71,6 +78,12 @@ class Manus(ToolCallAgent):
     )  # server_id -> url/command
     mcp_instruction_servers: set[str] = Field(default_factory=set, exclude=True)
     _initialized: bool = False
+
+    @model_validator(mode="after")
+    def initialize_helper(self) -> "Manus":
+        """同步初始化基本组件。"""
+        self.browser_context_helper = BrowserContextHelper(self)
+        return self
 
     @classmethod
     async def create(cls, **kwargs) -> "Manus":
@@ -82,9 +95,18 @@ class Manus(ToolCallAgent):
 
     async def initialize_mcp_servers(self) -> None:
         """Initialize connections to configured MCP servers."""
-        if _BROWSER_USE_SERVER_ID not in config.mcp_config.servers and os.getenv(
+        # 跳过自动连接的条件：
+        # 1. 已在 mcp.json 中配置了 browser_use 服务器（走下方的手动配置循环）
+        # 2. 环境变量 OPENMANUS_DISABLE_BROWSER_USE 被设置
+        # 3. config.toml [mcp] 段配置了 disable_browser_use = true
+        disable_by_env = os.getenv(
             "OPENMANUS_DISABLE_BROWSER_USE", ""
-        ).lower() not in {"1", "true", "yes"}:
+        ).lower() in {"1", "true", "yes"}
+        if (
+            _BROWSER_USE_SERVER_ID not in config.mcp_config.servers
+            and not config.mcp_config.disable_browser_use
+            and not disable_by_env
+        ):
             try:
                 await self.connect_mcp_server(
                     _BROWSER_USE_COMMAND,
@@ -97,6 +119,7 @@ class Manus(ToolCallAgent):
                 logger.info("Connected to Browser Use CLI 3.0 through MCP")
             except Exception as e:
                 logger.error(f"Failed to connect to Browser Use CLI 3.0: {e}")
+        # 禁用时静默跳过，不打印日志（保持与老项目一致的启动输出）
 
         for server_id, server_config in config.mcp_config.servers.items():
             try:
@@ -188,16 +211,107 @@ class Manus(ToolCallAgent):
         self.available_tools.add_tools(*self.mcp_clients.tools)
 
     async def cleanup(self):
-        """Clean up Manus agent resources."""
-        # Disconnect from all MCP servers only if we were initialized
+        """清理 Manus agent 资源。"""
+        if self.browser_context_helper:
+            await self.browser_context_helper.cleanup_browser()
+        # 仅在已初始化的情况下断开所有 MCP 服务器连接
         if self._initialized:
             await self.disconnect_mcp_server()
             self._initialized = False
 
     async def think(self) -> bool:
-        """Process current state and decide next actions with appropriate context."""
+        """处理当前状态，并在适当的上下文中决定下一步行动。"""
         if not self._initialized:
             await self.initialize_mcp_servers()
             self._initialized = True
 
-        return await super().think()
+        original_prompt = self.next_step_prompt
+        original_llm = self.llm
+
+        # 检查最近消息中是否有浏览器工具在使用
+        recent_messages = self.memory.messages[-5:] if self.memory.messages else []
+        browser_in_use = any(
+            tc.function.name == BrowserUseTool().name
+            for msg in recent_messages
+            if hasattr(msg, 'tool_calls') and msg.tool_calls
+            for tc in msg.tool_calls
+        )
+
+        # 检查消息中是否有浏览器截图（说明浏览器工具已使用，需要视觉理解）
+        has_browser_screenshot = any(
+            (isinstance(msg, Message) and getattr(msg, 'base64_image', None))
+            or (isinstance(msg, dict) and msg.get("base64_image"))
+            for msg in recent_messages
+        )
+
+        # 检查工具列表中是否包含浏览器工具
+        browser_tool_available = BrowserUseTool().name in [
+            tool.name for tool in self.available_tools.tools
+        ]
+
+        # 智能切换策略：
+        # browser-use 库返回的元素信息格式：[index]<type>text</type>
+        # 包含：索引、元素类型（button、input等）、文本描述
+        # 如果元素描述足够详细，默认模型应该能够根据文本匹配选择正确的元素
+        # 因此：默认使用快速模型，只在有截图且当前模型不支持图片时才切换到视觉模型
+
+        # 如果浏览器工具可用，使用 browser_context_helper 来格式化 prompt
+        if browser_tool_available:
+            logger.debug(f"🚀 Using default model for browser automation: {self.llm.model}")
+            logger.debug(f"📝 Browser-use provides element descriptions in format: [index]<type>text</type>")
+
+            self.next_step_prompt = (
+                await self.browser_context_helper.format_next_step_prompt()
+            )
+
+        # === 视觉模型自动切换逻辑 ===
+        # 当消息中包含浏览器截图，且当前模型不支持图片理解时，自动切换到 vision 模型
+        if has_browser_screenshot and self.llm.model not in MULTIMODAL_MODELS:
+            if "vision" in config.llm:
+                vision_llm = LLM(config_name="vision")
+                if vision_llm.model in MULTIMODAL_MODELS:
+                    logger.info(
+                        f"👁️ Screenshots detected & current model '{self.llm.model}' "
+                        f"does NOT support images. Switching to vision model: '{vision_llm.model}'"
+                    )
+                    self.llm = vision_llm
+                else:
+                    logger.warning(
+                        f"⚠️ Vision model '{vision_llm.model}' is NOT in MULTIMODAL_MODELS. "
+                        f"Images will be stripped. Please add it to MULTIMODAL_MODELS in llm.py."
+                    )
+            else:
+                logger.warning(
+                    f"⚠️ Screenshots detected but no [llm.vision] configured in config.toml. "
+                    f"Images will be ignored by model '{self.llm.model}'."
+                )
+        elif has_browser_screenshot and self.llm.model in MULTIMODAL_MODELS:
+            logger.debug(
+                f"👁️ Screenshots detected & current model '{self.llm.model}' "
+                f"natively supports images — no vision switch needed."
+            )
+
+        result = await super().think()
+
+        # 恢复原始 prompt
+        self.next_step_prompt = original_prompt
+
+        # 恢复原始 LLM 的逻辑：
+        # 只有当最近的消息中既没有浏览器工具调用，也没有截图时，才恢复
+        if original_llm != self.llm:
+            current_browser_in_use = any(
+                tc.function.name == BrowserUseTool().name
+                for msg in self.memory.messages[-3:]
+                if hasattr(msg, 'tool_calls') and msg.tool_calls
+                for tc in msg.tool_calls
+            )
+            current_has_screenshot = any(
+                (isinstance(msg, Message) and getattr(msg, 'base64_image', None))
+                or (isinstance(msg, dict) and msg.get("base64_image"))
+                for msg in self.memory.messages[-3:]
+            )
+            if not current_browser_in_use and not current_has_screenshot:
+                logger.debug(f"🔄 Restoring original LLM: {original_llm.model}")
+                self.llm = original_llm
+
+        return result

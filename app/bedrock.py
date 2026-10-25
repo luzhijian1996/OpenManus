@@ -12,7 +12,7 @@ import boto3
 # Tmp solution
 CURRENT_TOOLUSE_ID = None
 
-
+"""兼容AWS 的bedrock"""
 # Class to handle OpenAI-style response formatting
 class OpenAIResponse:
     def __init__(self, data):

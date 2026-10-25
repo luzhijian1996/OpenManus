@@ -38,9 +38,47 @@ class ToolCallAgent(ReActAgent):
 
     async def think(self) -> bool:
         """Process current state and decide next actions using tools"""
+
+        # 优化：移除旧的 next_step_prompt，避免消息列表中重复元素过多
+        if self.next_step_prompt and len(self.messages) > 0:
+            # 从后往前查找并移除旧的 next_step_prompt
+            for i in range(len(self.messages) - 1, -1, -1):
+                if (self.messages[i].role == "user" and
+                        self.messages[i].content == self.next_step_prompt):
+                    self.messages.pop(i)
+                    break
+
+        # 添加最新的 next_step_prompt
         if self.next_step_prompt:
             user_msg = Message.user_message(self.next_step_prompt)
             self.messages += [user_msg]
+
+        # 打印 LLM 调用的详细信息
+        logger.debug(f"\n{'='*50}")
+        logger.debug(f"📝 LLM Call - System Prompt:")
+        logger.debug(f"{'='*50}")
+        if self.system_prompt:
+            logger.debug(f"{self.system_prompt}")
+        else:
+            logger.debug("[No system prompt]")
+
+        logger.debug(f"\n{'='*50}")
+        logger.debug(f"💬 LLM Call - Messages ({len(self.messages)} total):")
+        logger.debug(f"{'='*50}")
+        for i, msg in enumerate(self.messages, 1):
+            role = msg.role.upper()
+            content_preview = msg.content[:200] + "..." if len(str(msg.content)) > 200 else msg.content
+            logger.debug(f"[{i}] {role}: {content_preview}")
+            # assistant 消息的 content 与 tool_calls 并存，一并打印便于调试
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    args_preview = str(tc.function.arguments)[:150]
+                    logger.debug(f"    🔗 tool_call → {tc.function.name}({args_preview})")
+
+        logger.debug(f"\n{'='*50}")
+        logger.debug(f"🛠️ Available Tools: {[tool.name for tool in self.available_tools.tools]}")
+        logger.debug(f"🎯 Tool Choice: {self.tool_choices}")
+        logger.debug(f"{'='*50}\n")
 
         try:
             # Get response with tool options
@@ -65,7 +103,7 @@ class ToolCallAgent(ReActAgent):
                 )
                 self.memory.add_message(
                     Message.assistant_message(
-                        f"Maximum token limit reached, cannot continue execution: {str(token_limit_error)}"
+                        f"达到最大 token 限制，无法继续执行: {str(token_limit_error)}"
                     )
                 )
                 self.state = AgentState.FINISHED
@@ -103,7 +141,8 @@ class ToolCallAgent(ReActAgent):
                     return True
                 return False
 
-            # Create and add assistant message
+            # 直接将 LLM 输出的 content 与 tool_calls 合并加入消息
+            # （content 可能为空，这是合法的 API 行为，不伪造填充）
             assistant_msg = (
                 Message.from_tool_calls(content=content, tool_calls=self.tool_calls)
                 if self.tool_calls
@@ -123,13 +162,13 @@ class ToolCallAgent(ReActAgent):
             logger.error(f"🚨 Oops! The {self.name}'s thinking process hit a snag: {e}")
             self.memory.add_message(
                 Message.assistant_message(
-                    f"Error encountered while processing: {str(e)}"
+                    f"处理过程中遇到错误: {str(e)}"
                 )
             )
             return False
 
     async def act(self) -> str:
-        """Execute tool calls and handle their results"""
+        """并行执行工具调用并处理结果"""
         if not self.tool_calls:
             if self.tool_choices == ToolChoice.REQUIRED:
                 raise ValueError(TOOL_CALL_REQUIRED)
@@ -137,16 +176,35 @@ class ToolCallAgent(ReActAgent):
             # Return last message content if no tool calls
             return self.messages[-1].content or "No content or commands to execute"
 
-        results = []
-        image_messages = []
-        for command in self.tool_calls:
-            # Reset base64_image for each tool call
-            self._current_base64_image = None
-
+        # 并行执行所有工具调用
+        async def _execute_one(command: ToolCall):
+            """执行单个工具调用，返回 (result_str, base64_image)"""
             result = await self.execute_tool(command)
-
             if self.max_observe:
                 result = result[: self.max_observe]
+            # 获取该工具产生的截图（如果有）
+            image = getattr(self, '_tool_images', {}).get(command.id)
+            return result, image
+
+        # 初始化截图收集容器
+        self._tool_images = {}
+
+        # 使用 asyncio.gather 并行执行所有工具
+        task_results = await asyncio.gather(
+            *[_execute_one(cmd) for cmd in self.tool_calls],
+            return_exceptions=True
+        )
+
+        results = []
+        image_messages = []
+        for i, (command, task_result) in enumerate(zip(self.tool_calls, task_results)):
+            # 处理异常情况
+            if isinstance(task_result, Exception):
+                result = f"Error: Tool '{command.function.name}' failed: {task_result}"
+                base64_img = None
+                logger.error(f"🚨 Tool '{command.function.name}' raised exception: {task_result}")
+            else:
+                result, base64_img = task_result
 
             logger.info(
                 f"🎯 Tool '{command.function.name}' completed its mission! Result: {result}"
@@ -159,16 +217,22 @@ class ToolCallAgent(ReActAgent):
                 name=command.function.name,
             )
             self.memory.add_message(tool_msg)
-            if self._current_base64_image:
+
+            if base64_img:
                 image_messages.append(
                     Message.user_message(
                         content=f"Image returned by {command.function.name}:",
-                        base64_image=self._current_base64_image,
+                        base64_image=base64_img,
                     )
                 )
             results.append(result)
 
-        self.memory.add_messages(image_messages)
+        if image_messages:
+            self.memory.add_messages(image_messages)
+
+        # 清理临时截图容器
+        self._tool_images = {}
+
         return "\n\n".join(results)
 
     async def execute_tool(self, command: ToolCall) -> str:
@@ -186,6 +250,7 @@ class ToolCallAgent(ReActAgent):
 
             # Execute the tool
             logger.info(f"🔧 Activating tool: '{name}'...")
+            logger.debug(f"🔧 Tool arguments: {args}")
             result = await self.available_tools.execute(name=name, tool_input=args)
 
             # Handle special tools
@@ -193,8 +258,21 @@ class ToolCallAgent(ReActAgent):
 
             # Check if result is a ToolResult with base64_image
             if hasattr(result, "base64_image") and result.base64_image:
-                # Store the base64_image for later use in tool_message
-                self._current_base64_image = result.base64_image
+                image_size_kb = len(result.base64_image) * 3 / 4 / 1024
+                logger.info(f"📷 Tool '{name}' returned screenshot: {image_size_kb:.2f} KB")
+                # 将截图存储到临时容器，供 act() 并行收集
+                if not hasattr(self, '_tool_images'):
+                    self._tool_images = {}
+                self._tool_images[command.id] = result.base64_image
+            else:
+                logger.debug(f"📷 Tool '{name}' did not return screenshot")
+
+            # 调试信息：显示工具执行结果
+            if hasattr(result, "error") and result.error:
+                logger.error(f"❌ Tool '{name}' failed: {result.error}")
+            else:
+                result_preview = str(result)[:200] + "..." if len(str(result)) > 200 else str(result)
+                logger.debug(f"✅ Tool '{name}' result preview: {result_preview}")
 
             # Format result for display (standard case)
             observation = (

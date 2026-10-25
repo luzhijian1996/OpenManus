@@ -13,6 +13,7 @@ from app.logger import logger
 from app.tool.base import BaseTool, ToolResult
 
 
+"""网页爬虫工具"""
 class Crawl4aiTool(BaseTool):
     """
     Web crawler tool powered by Crawl4AI.

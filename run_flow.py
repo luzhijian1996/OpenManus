@@ -7,7 +7,7 @@ from app.config import config
 from app.flow.flow_factory import FlowFactory, FlowType
 from app.logger import logger
 
-
+"""多代理流式工作流(多智能体)运行入口"""
 async def run_flow():
     agents = {
         "manus": Manus(),

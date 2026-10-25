@@ -9,7 +9,7 @@ from app.logger import logger
 from app.sandbox.client import SANDBOX_CLIENT
 from app.schema import ROLE_TYPE, AgentState, Memory, Message
 
-
+"""提供状态机、记忆、步数控制、异常回复"""
 class BaseAgent(BaseModel, ABC):
     """Abstract base class for managing agent state and execution.
 
@@ -75,9 +75,6 @@ class BaseAgent(BaseModel, ABC):
         self.state = new_state
         try:
             yield
-        except Exception as e:
-            self.state = AgentState.ERROR  # Transition to ERROR on failure
-            raise e
         finally:
             self.state = previous_state  # Revert to previous state
 
@@ -129,16 +126,16 @@ class BaseAgent(BaseModel, ABC):
             raise RuntimeError(f"Cannot run agent from state: {self.state}")
 
         if request:
-            self.update_memory("user", request)
+            self.update_memory("user", request)  # 添加用户请求到内存
 
         results: List[str] = []
         async with self.state_context(AgentState.RUNNING):
             while (
-                self.current_step < self.max_steps and self.state != AgentState.FINISHED
+                self.current_step < self.max_steps and self.state != AgentState.FINISHED  # 循环最多执行max_steps次
             ):
                 self.current_step += 1
                 logger.info(f"Executing step {self.current_step}/{self.max_steps}")
-                step_result = await self.step()
+                step_result = await self.step()  # 执行单步： think + act
 
                 # Check for stuck state
                 if self.is_stuck():

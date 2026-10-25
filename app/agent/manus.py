@@ -244,22 +244,15 @@ class Manus(ToolCallAgent):
             for msg in recent_messages
         )
 
-        # 检查工具列表中是否包含浏览器工具
-        browser_tool_available = BrowserUseTool().name in [
-            tool.name for tool in self.available_tools.tools
-        ]
-
         # 智能切换策略：
         # browser-use 库返回的元素信息格式：[index]<type>text</type>
         # 包含：索引、元素类型（button、input等）、文本描述
         # 如果元素描述足够详细，默认模型应该能够根据文本匹配选择正确的元素
         # 因此：默认使用快速模型，只在有截图且当前模型不支持图片时才切换到视觉模型
 
-        # 如果浏览器工具可用，使用 browser_context_helper 来格式化 prompt
-        if browser_tool_available:
-            logger.debug(f"🚀 Using default model for browser automation: {self.llm.model}")
-            logger.debug(f"📝 Browser-use provides element descriptions in format: [index]<type>text</type>")
-
+        # 只有浏览器工具在最近步骤中实际被使用时，才采集浏览器状态并格式化 prompt
+        # 避免每步无条件调用 get_current_state()（截图 + DOM 解析约 1 秒）
+        if browser_in_use:
             self.next_step_prompt = (
                 await self.browser_context_helper.format_next_step_prompt()
             )
@@ -286,10 +279,7 @@ class Manus(ToolCallAgent):
                     f"Images will be ignored by model '{self.llm.model}'."
                 )
         elif has_browser_screenshot and self.llm.model in MULTIMODAL_MODELS:
-            logger.debug(
-                f"👁️ Screenshots detected & current model '{self.llm.model}' "
-                f"natively supports images — no vision switch needed."
-            )
+            pass  # 当前模型已支持图片，无需切换
 
         result = await super().think()
 

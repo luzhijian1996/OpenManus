@@ -118,6 +118,17 @@ class WebContentFetcher:
         Returns:
             Extracted text content or None if fetching fails
         """
+        # 过滤无效 URL
+        if not url or not url.strip():
+            return None
+        # 相对路径 URL（常见于百度搜索结果）直接跳过
+        if url.startswith("/"):
+            logger.debug(f"Skipping relative URL: {url[:80]}")
+            return None
+        # 确保 URL 有 scheme
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+
         headers = {
             "WebSearch": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
@@ -309,7 +320,14 @@ class WebSearch(BaseTool):
                     f"Search successful with {engine_name.capitalize()} after trying: {', '.join(failed_engines)}"
                 )
 
-            # Transform search items into structured results
+            # Transform search items into structured results, filtering out invalid entries
+            valid_items = [
+                item for item in search_items
+                if item.url and not item.url.startswith("/")
+            ]
+            if not valid_items:
+                continue
+
             return [
                 SearchResult(
                     position=i + 1,
@@ -319,7 +337,7 @@ class WebSearch(BaseTool):
                     description=item.description or "",
                     source=engine_name,
                 )
-                for i, item in enumerate(search_items)
+                for i, item in enumerate(valid_items)
             ]
 
         if failed_engines:

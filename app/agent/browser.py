@@ -4,8 +4,6 @@ from typing import TYPE_CHECKING, Optional
 from app.agent.mcp import MCPAgent
 from app.logger import logger
 from app.prompt.browser import NEXT_STEP_PROMPT
-from app.schema import Message
-from app.tool.sandbox.sb_browser_tool import SandboxBrowserTool
 from app.tool.terminate import Terminate
 
 
@@ -21,7 +19,6 @@ _BROWSER_USE_TOOL_NAME = "browser_use"
 class BrowserContextHelper:
     def __init__(self, agent: "BaseAgent"):
         self.agent = agent
-        self._current_base64_image: Optional[str] = None
 
     def _find_browser_tool(self):
         """两级回退查找浏览器工具：优先 BrowserUseTool，其次 SandboxBrowserTool。"""
@@ -31,26 +28,30 @@ class BrowserContextHelper:
         return browser_tool
 
     async def get_browser_state(self) -> Optional[dict]:
+        """获取浏览器状态文本信息（URL、标签页、交互元素等）。
+
+        注意：此方法不再采集截图。截图由 toolcall.py 的 act() 在工具执行后自动添加，
+        避免同一页面状态被截图两次导致 token 浪费和 API 报错。
+        """
         browser_tool = self._find_browser_tool()
         if not browser_tool or not hasattr(browser_tool, "get_current_state"):
-            logger.warning("Browser tool not found or has no get_current_state method")
             return None
         try:
             result = await browser_tool.get_current_state()
             if result.error:
-                logger.debug(f"Browser state error: {result.error}")
+                logger.debug(f"Browser state error (skipping): {result.error}")
                 return None
-            if hasattr(result, "base64_image") and result.base64_image:
-                self._current_base64_image = result.base64_image
-            else:
-                self._current_base64_image = None
             return json.loads(result.output)
         except Exception as e:
             logger.debug(f"Failed to get browser state: {str(e)}")
             return None
 
     async def format_next_step_prompt(self) -> str:
-        """获取浏览器状态并格式化浏览器提示词。"""
+        """获取浏览器状态并格式化浏览器提示词。
+
+        仅采集文本状态信息（URL、标签页、交互元素），不发送截图。
+        截图由 toolcall.py 的 act() 在工具执行后自动附加到消息中。
+        """
         browser_state = await self.get_browser_state()
         url_info, tabs_info, content_above_info, content_below_info = "", "", "", ""
         results_info = ""
@@ -70,21 +71,7 @@ class BrowserContextHelper:
             # 调试信息：显示可交互元素数量
             interactive_elements = browser_state.get("interactive_elements", "")
             element_count = interactive_elements.count("[") if interactive_elements else 0
-            logger.info(f"🔍 Browser state: {element_count} interactive elements detected")
-            logger.debug(f"🔍 Browser URL: {browser_state.get('url', 'N/A')}")
-            logger.debug(f"🔍 Browser Title: {browser_state.get('title', 'N/A')}")
-            if interactive_elements:
-                preview = interactive_elements[:200] + "..." if len(interactive_elements) > 200 else interactive_elements
-                logger.debug(f"🔍 Interactive elements preview: {preview}")
-
-            # 发送截图给 LLM 进行视觉理解
-            if self._current_base64_image:
-                image_message = Message.user_message(
-                    content="Current browser screenshot:",
-                    base64_image=self._current_base64_image,
-                )
-                self.agent.memory.add_message(image_message)
-                self._current_base64_image = None  # 添加后消耗图片
+            logger.debug(f"🔍 Browser state: {element_count} interactive elements, URL={browser_state.get('url', 'N/A')}")
 
         prompt = NEXT_STEP_PROMPT.format(
             url_placeholder=url_info,
@@ -94,7 +81,7 @@ class BrowserContextHelper:
             results_placeholder=results_info,
         )
 
-        # 追加交互元素列表到 prompt（参考项目的亮点：让 LLM 直接看到可点击元素）
+        # 追加交互元素列表到 prompt，让 LLM 直接看到可点击元素
         if browser_state and not browser_state.get("error"):
             interactive_elements = browser_state.get("interactive_elements", "")
             if interactive_elements:

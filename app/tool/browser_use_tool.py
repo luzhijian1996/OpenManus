@@ -188,21 +188,59 @@ class BrowserUseTool(BaseTool, Generic[Context]):
 
         return self.context
 
+    # 截图最大允许大小（KB），超过此值将进一步压缩
+    _MAX_SCREENSHOT_KB = 800
+
     async def _capture_screenshot(self) -> Optional[str]:
-        """拍摄当前页面的截图，返回 base64 编码字符串。失败时返回 None。"""
+        """拍摄当前可视区域的截图，返回 base64 编码字符串。失败时返回 None。
+
+        仅截取可视区域（非全页面），并对截图质量进行控制，避免体积过大导致 API 拒绝。
+        """
         try:
             if not self.context:
                 return None
             page = await self.context.get_current_page()
             await page.bring_to_front()
             await page.wait_for_load_state()
+            # 仅截取可视区域（full_page=False），避免长页面产生数 MB 的截图
             screenshot_bytes = await page.screenshot(
-                full_page=True, animations="disabled", type="jpeg", quality=100
+                full_page=False, animations="disabled", type="jpeg", quality=60
             )
-            return base64.b64encode(screenshot_bytes).decode("utf-8")
+            base64_str = base64.b64encode(screenshot_bytes).decode("utf-8")
+            # 检查大小，如果仍然过大，用 Pillow 缩放
+            size_kb = len(base64_str) * 3 / 4 / 1024
+            if size_kb > self._MAX_SCREENSHOT_KB:
+                base64_str = await self._compress_screenshot(base64_str)
+            return base64_str
         except Exception as e:
             logger.debug(f"Failed to capture screenshot after action: {e}")
             return None
+
+    async def _compress_screenshot(self, base64_str: str) -> str:
+        """对过大的截图进行缩放压缩，直到低于 _MAX_SCREENSHOT_KB。"""
+        try:
+            import io
+            from PIL import Image
+            img_bytes = base64.b64decode(base64_str)
+            img = Image.open(io.BytesIO(img_bytes))
+            # 逐步缩小到 50%，直到满足大小要求或宽度过小
+            scale = 0.5
+            for _ in range(4):  # 最多缩放 4 次（50% -> 25% -> 12.5% -> 6.25%）
+                new_w = max(int(img.width * scale), 320)
+                new_h = max(int(img.height * scale), 240)
+                resized = img.resize((new_w, new_h), Image.LANCZOS)
+                buf = io.BytesIO()
+                resized.save(buf, format="JPEG", quality=50)
+                compressed = base64.b64encode(buf.getvalue()).decode("utf-8")
+                size_kb = len(compressed) * 3 / 4 / 1024
+                logger.debug(f"Screenshot compressed: {new_w}x{new_h}, {size_kb:.1f} KB")
+                if size_kb <= self._MAX_SCREENSHOT_KB or new_w <= 320:
+                    return compressed
+                scale *= 0.5
+            return compressed
+        except Exception as e:
+            logger.warning(f"Screenshot compression failed, returning original: {e}")
+            return base64_str
 
     async def execute(
         self,
@@ -563,12 +601,18 @@ Page content:
             await page.bring_to_front()
             await page.wait_for_load_state()
 
-            screenshot = await page.screenshot(
-                full_page=True, animations="disabled", type="jpeg", quality=100
+            # 仅截取可视区域，避免长页面截图过大导致 API 拒绝
+            screenshot_bytes = await page.screenshot(
+                full_page=False, animations="disabled", type="jpeg", quality=60
             )
 
-            screenshot = base64.b64encode(screenshot).decode("utf-8")
-            screenshot_size_kb = len(screenshot) * 3 / 4 / 1024  # 估算截图大小（KB）
+            screenshot = base64.b64encode(screenshot_bytes).decode("utf-8")
+            screenshot_size_kb = len(screenshot) * 3 / 4 / 1024
+
+            # 如果截图仍然过大，进行压缩
+            if screenshot_size_kb > self._MAX_SCREENSHOT_KB:
+                screenshot = await self._compress_screenshot(screenshot)
+                screenshot_size_kb = len(screenshot) * 3 / 4 / 1024
 
             # 获取可交互元素信息
             interactive_elements_str = (
